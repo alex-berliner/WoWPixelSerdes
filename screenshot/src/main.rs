@@ -1,7 +1,9 @@
-use rustc_serialize::json::{Json, ToJson};
-use std::io::{BufRead, BufReader};
+use tokio::sync::mpsc::{Sender, Receiver, channel};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use cbor::{Decoder, Encoder};
+use rustc_serialize::json::{Json, ToJson};
+
+use cbor::{Decoder};
 
 use image::imageops::flip_vertical;
 use image::{ImageBuffer, Rgba};
@@ -9,14 +11,11 @@ use std::mem::size_of;
 use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    SRCCOPY,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS, PW_CLIENTONLY};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetSystemMetrics, GetWindowRect, PW_RENDERFULLCONTENT, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-};
+    GetClientRect, GetWindowRect, PW_RENDERFULLCONTENT};
 use win_screenshot::addon::*;
 
 #[derive(Debug)]
@@ -156,15 +155,30 @@ fn all_values_equal<T: PartialEq>(vec: &Vec<T>) -> bool {
     vec.iter().all(|x| x.eq(&vec[0]))
 }
 
-fn pixel_validate_get(img: &ImageBuffer<Rgba<u8>, Vec<u8>>, x: u32) -> Result<Rgba<u8>, &'static str> {
-    let pixels = (0..3)
+fn pixel_validate_get(img: &ImageBuffer<Rgba<u8>, Vec<u8>>, x: u32, height: u8) -> Result<Rgba<u8>, &'static str> {
+    let pixels = (0..height)
         .filter_map(|y| Some(img.get_pixel(x, y as u32)))
         .collect::<Vec<_>>();
 
-    if all_values_equal(&pixels) {
-        Ok(*pixels[0])
+    let mut counts = std::collections::HashMap::new();
+    for pixel in pixels.iter() {
+        *counts.entry(pixel).or_insert(0) += 1;
+    }
+
+    let mut most_common_pixel = &pixels[0];
+    let mut most_common_count = 0;
+    for (pixel, count) in counts.iter() {
+        if count > &most_common_count {
+            most_common_pixel = pixel;
+            most_common_count = *count;
+        }
+    }
+
+    if most_common_count >= 2 {
+        Ok(*most_common_pixel.clone())
     } else {
-        Err("Not all values in the Vec are equal")
+        // self.save();
+        Err("FRAME Not at least 2 pixels are the same")
     }
 }
 
@@ -177,15 +191,36 @@ struct Frame {
     img: ImageBuffer<Rgba<u8>, Vec<u8>>,
 }
 impl Frame {
-    pub fn pixel_validate_get(&mut self, x: u32) -> Result<Rgba<u8>, &'static str> {
+    pub fn save(&mut self) {
+        let posix_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut file_name = posix_time.to_string();
+        file_name.push_str(".bmp");
+        self.img.save(file_name).unwrap();
+    }
+    fn pixel_validate_get(&mut self, x: u32) -> Result<Rgba<u8>, &'static str> {
         let pixels = (0..self.height)
             .filter_map(|y| Some(self.img.get_pixel(x, y as u32)))
             .collect::<Vec<_>>();
 
-        if all_values_equal(&pixels) {
-            Ok(*pixels[0])
+        let mut counts = std::collections::HashMap::new();
+        for pixel in pixels.iter() {
+            *counts.entry(pixel).or_insert(0) += 1;
+        }
+
+        let mut most_common_pixel = &pixels[0];
+        let mut most_common_count = 0;
+        for (pixel, count) in counts.iter() {
+            if count > &most_common_count {
+                most_common_pixel = pixel;
+                most_common_count = *count;
+            }
+        }
+
+        if most_common_count >= 2 {
+            Ok(*most_common_pixel.clone())
         } else {
-            Err("Not all values in the Vec are equal")
+            self.save();
+            Err("FRAME Not at least 2 pixels are the same")
         }
     }
 
@@ -207,6 +242,7 @@ impl Frame {
                     p
                 },
                 Err(e) => {
+                    println!("{}", i);
                     return Err(e);
                 }
             };
@@ -223,48 +259,37 @@ impl Frame {
         Ok(pix_vec)
     }
 }
-fn hex_dump(data: &[u8]) {
-    println!("{}", data.len());
-    for chunk in data.chunks(16) {
-        print!("{:08x}  ", data.as_ptr() as usize);
-        for &byte in chunk {
-            print!("{:02x} ", byte);
-        }
-        println!();
-    }
-}
 
-fn main() {
+async fn read_wow(tx: Sender<Json>) {
     let hwnd = find_window("World of Warcraft").unwrap();
     let mut clock_old:u32 = 9999;
     let mut total_packets = 1.0;
     let mut good_packets = 1.0;
+    let pixel_height:u8 = 6;
     loop {
-        let mut checksum_cx = 0;
-        let mut s = capture_window(hwnd, Area::Full, 400, 3).unwrap();
+        let s = capture_window(hwnd, Area::Full, 400, pixel_height as i32).unwrap();
         // make dependent on pixel width somehow to avoid errors when changing size
-        let pixel = match pixel_validate_get(&s, 0) {
+        let pixel = match pixel_validate_get(&s, 0, pixel_height) {
             Ok(o) => o,
             Err(e) => { println!("bad header pixel"); total_packets = total_packets + 1.0; continue; }
         }; //s.get_pixel(0,0);
         let header = color_to_integer(&pixel);
         let (size, checksum_rx, clock) = decode_header(header);
-        println!("{}", size);
         let mut frame = Frame {
             size: size,
             checksum: checksum_rx,
             clock: clock,
             width: 1,
-            height: 3,
+            height: pixel_height,
             img: s
         };
-        if clock_old == clock.into() {
+        if clock_old == clock as u32 {
             // not necessary to warn, rust just reads really fast
             // println!("same clock clock_old {} clock {}", clock_old , clock );
             continue;
         }
         total_packets = total_packets + 1.0;
-        let mut myvec = match frame.get_all_pixels() {
+        let myvec = match frame.get_all_pixels() {
             Ok(o) =>  {/* println!("good frame"); */ o },
             Err(e) => { println!("{}", e); continue; }
         };
@@ -287,13 +312,25 @@ fn main() {
             continue;
         }
         good_packets = good_packets + 1.0;
-        // println!("good packets: {}", good_packets/total_packets);
-        // hex_dump(&bytevec);
         let mut d = Decoder::from_bytes(bytevec);
-        let cbor = d.items().next().unwrap().unwrap();
-        // println!("{}", cbor.to_json()["a"].to_string().len());
-        println!("{:?}", cbor.to_json());
-
+        let cbor = match d.items().next().unwrap() {
+            Ok(o) => o,
+            Err(e) => {println!("{}", e); continue;}
+        };
+        tx.send(cbor.to_json()).await;
         clock_old = clock.into();
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let (tx, mut rx) = channel(100);
+    tokio::spawn(async move {
+        read_wow(tx).await;
+    });
+    loop {
+        while let Ok(received) = rx.try_recv() {
+            println!("{:?}", received);
+        }
     }
 }

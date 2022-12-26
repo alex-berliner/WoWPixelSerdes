@@ -1,8 +1,9 @@
 -- Notes: max table size is 300
 local BOX_WIDTH = 1
-local BOX_HEIGHT = 3
+local BOX_HEIGHT = 6
 -- max pixel boxes, most will usually be turned off.
 -- no cost to increasing this besides increased screen real estate
+-- 100 is the max because lua strings appear not to be able to hold more than 300 bytes
 local NUM_BOXES = 100
 -- pixel boxes that numbers are stored in
 -- stores rbg valuess that hold 0xFFFFFF each
@@ -11,19 +12,56 @@ local boxes = {}
 local _, ADDONSELF = ...
 
 local cbor = get_cbor()
+tx_healing = 0
+tx_overhealing = 0
+tx_damage = 0
 
 function init()
     init_my_serialized_data()
     create_boxes()
     UIParent:SetScript("OnUpdate", OnUpdate)
+    f = CreateFrame("Frame")
+    -- Register the OnCombatLogEvent function to the COMBAT_LOG_EVENT_UNFILTERED event
+    f:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    f:SetScript("OnEvent", OnCombatLogEvent)
+end
+
+-- Define the OnCombatLogEvent function
+function OnCombatLogEvent(event, ...)
+    function parse_heal(...)
+        local timestamp, subevent, _, sourceGUID, sourceName, sourceFlags, sourceRaidFlags, destGUID, destName, destFlags, destRaidFlags = ...
+        local spellId, spellName, spellSchool = select(12, ...)
+        -- Check if the sourceGUID is your character's GUID
+        if sourceGUID == UnitGUID("player") then
+            healing, overhealing, absorbed, critical = select(15, ...)
+            tx_overhealing = tx_overhealing + overhealing
+            tx_healing = tx_healing + healing - overhealing
+        end
+    end
+    function parse_dmg(...)
+        local timestamp, subevent, _, sourceGUID, sourceName, sourceFlags, sourceRaidFlags, destGUID, destName, destFlags, destRaidFlags = ...
+        local spellId, spellName, spellSchool = select(12, ...)
+        if sourceGUID == UnitGUID("player") then
+            amount, overkill, school, resisted, blocked, absorbed, critical, glancing, crushing, isOffHand = select(15, ...)
+            -- print("amount: " .. tostring(amount))
+            tx_damage = tx_damage + amount
+        end
+    end
+    function parse_event(...)
+        local timestamp, subevent, _, sourceGUID, sourceName, sourceFlags, sourceRaidFlags, destGUID, destName, destFlags, destRaidFlags = ...
+        if subevent == "SPELL_HEAL" or subevent == "SPELL_PERIODIC_HEAL" then
+            parse_heal(...)
+        end
+        if subevent == "SPELL_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE" then
+            parse_dmg(...)
+        end
+    end
+    parse_event(CombatLogGetCurrentEventInfo())
 end
 
 function init_my_serialized_data()
     d = {
-        a="a",b="2",c="3",d="4",e="5",f="6",g="7",h="8",i="9",
-        a1="a",b1="2",c1="3",d1="4",e1="5",f1="6",g1="7",h1="8",i1="9",
-        a2="a",b2="2",c2="3",d2="4",e2="5",f2="6",g2="7",h2="8",i2="9",
-        ctr=0
+        empty=0,
     }
 end
 
@@ -89,8 +127,19 @@ end
 
 local clock = 0
 function OnUpdate(self, elapsed)
+    d = {
+        healing=tx_healing,
+        overhealing=tx_overhealing,
+        damage=tx_damage,
+    }
     local t = cbor.encode(d)
     local checksum = 0
+    -- if tx_healing > 0 then
+    --     print(tx_healing)
+    -- end
+    tx_healing = 0
+    tx_overhealing = 0
+    tx_damage = 0
     -- pad serialized message to multiple of 3 bytes to align with the three rgb channels in a pixel
     orig_size = #t
     while (Modulo(#t, 3) ~= 0) do
